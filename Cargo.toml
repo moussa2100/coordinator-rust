@@ -11,6 +11,7 @@ dirs = "5"
 portable-pty = "0.8"
 vt100 = "0.15"
 arboard = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [patch.crates-io]
 vt100 = { path = "vendor/vt100" }

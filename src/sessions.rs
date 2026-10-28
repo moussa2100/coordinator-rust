@@ -6,6 +6,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Longest name shown in the list and tabs before it is cut short.
+const MAX_NAME_CHARS: usize = 60;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
@@ -69,33 +72,45 @@ impl Agent {
 pub struct SessionInfo {
     pub agent: Agent,
     pub id: String,
+    /// What the list shows: the session's title, else its first user message, else a short id.
+    pub name: String,
     pub cwd: String,
     pub modified: SystemTime,
 }
 
-/// Newest-first sessions for one agent. Missing directories yield an empty list.
-pub fn list_sessions(agent: Agent) -> Vec<SessionInfo> {
+/// Newest-first sessions for one agent that were recorded in `folder`.
+/// Missing directories yield an empty list. Sessions with no recorded folder are left out,
+/// since they cannot be matched to one.
+pub fn list_sessions(agent: Agent, folder: &str) -> Vec<SessionInfo> {
     let Some(root) = agent.sessions_root() else {
         return Vec::new();
     };
+    let wanted = normalize_folder(folder);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
     let mut files = Vec::new();
     collect_jsonl(&root, 3, &mut files);
 
     let mut sessions: Vec<SessionInfo> = files
         .into_iter()
         .filter_map(|path| {
+            let (header_id, cwd) = read_header(&path);
+            // The folder filter runs before the name scan, so only matching files are read in full.
+            let cwd = cwd.filter(|c| normalize_folder(c) == wanted)?;
             let modified = fs::metadata(&path).ok()?.modified().ok()?;
             let stem = path.file_stem()?.to_string_lossy().into_owned();
-            let (header_id, cwd) = read_header(&path);
             // Claude names each transcript after its session id; pi and omp write the id in the header.
             let id = match agent {
                 Agent::Claude => stem,
                 _ => header_id.unwrap_or(stem),
             };
+            let name = session_name(&path).unwrap_or_else(|| id.chars().take(8).collect());
             Some(SessionInfo {
                 agent,
                 id,
-                cwd: cwd.unwrap_or_default(),
+                name,
+                cwd,
                 modified,
             })
         })
@@ -104,6 +119,85 @@ pub fn list_sessions(agent: Agent) -> Vec<SessionInfo> {
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     sessions.truncate(200);
     sessions
+}
+
+/// The name a transcript should show. Omp writes a `title` record and pi writes a
+/// `session_info` name; the last one wins because later records update it. Without either,
+/// the first user message is used. Returns None when the file has no usable text.
+fn session_name(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut title: Option<String> = None;
+    let mut first_user: Option<String> = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        // Substring checks first, so most lines are never parsed as JSON.
+        let is_title = line.contains("\"type\":\"title\"");
+        let is_info = line.contains("\"type\":\"session_info\"");
+        let is_user = first_user.is_none() && line.contains("\"role\":\"user\"");
+        if !is_title && !is_info && !is_user {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if is_title || is_info {
+            let key = if is_title { "title" } else { "name" };
+            if let Some(name) = value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                title = Some(name.to_string());
+            }
+        } else {
+            first_user = user_text(&value);
+        }
+    }
+    title.or(first_user)
+}
+
+/// Text of a user message, shortened for display. Handles string and array content.
+fn user_text(value: &serde_json::Value) -> Option<String> {
+    let message = value.get("message")?;
+    if message.get("role")?.as_str()? != "user" {
+        return None;
+    }
+    let text = match message.get("content")? {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    tidy(&text)
+}
+
+/// The first line with real words, stripped of markdown marks and cut to `MAX_NAME_CHARS`.
+fn tidy(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .map(|l| l.trim().trim_matches(|c: char| "#*_`:>-".contains(c)).trim())
+        .find(|l| l.chars().any(char::is_alphanumeric))?;
+    let short: String = line.chars().take(MAX_NAME_CHARS).collect();
+    if line.chars().count() > MAX_NAME_CHARS {
+        Some(format!("{short}…"))
+    } else {
+        Some(short)
+    }
+}
+
+/// A folder path that compares equal across slash style, trailing slashes, and (on Windows) case.
+fn normalize_folder(path: &str) -> String {
+    let mut p = path.trim().replace('\\', "/");
+    while p.len() > 1 && p.ends_with('/') {
+        p.pop();
+    }
+    if cfg!(windows) {
+        p.make_ascii_lowercase();
+    }
+    p
 }
 
 fn collect_jsonl(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {

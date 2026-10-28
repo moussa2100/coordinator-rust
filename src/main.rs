@@ -1,6 +1,8 @@
+mod db;
 mod sessions;
 mod terminal;
 
+use db::{Database, Project};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use sessions::{Agent, SessionInfo};
@@ -43,6 +45,10 @@ enum Action {
     Activate(usize),
     Close(usize),
     Restart(usize),
+    ShowProjects,
+    AddProject,
+    OpenProject(usize),
+    RemoveProject(usize),
 }
 
 struct AgentApp {
@@ -55,35 +61,82 @@ struct AgentApp {
     new_cwd: String,
     status: String,
     store: PathBuf,
+    db: Database,
+    projects: Vec<Project>,
+    /// The project opened last. None means the home folder.
+    active_project: Option<Project>,
+    show_projects: bool,
+    new_project_name: String,
+    new_project_path: String,
+    project_error: Option<String>,
 }
 
 impl AgentApp {
     fn new() -> Self {
+        let _ = fs::create_dir_all(app_dir());
         let store = store_path();
         let saved = load_saved(&store);
         let slots: Vec<Slot> = saved.tabs.iter().map(|_| Slot::Idle).collect();
         let active = saved.active.filter(|&i| i < saved.tabs.len());
-        let status = if saved.tabs.is_empty() {
-            "No open tabs.".to_string()
-        } else {
-            format!("Restored {} tab(s).", saved.tabs.len())
+
+        let (db, db_error) = match Database::open(&db_path()) {
+            Ok(db) => (db, None),
+            Err(e) => (
+                Database::in_memory().expect("in-memory database"),
+                Some(format!("Projects will not be saved: {e}")),
+            ),
         };
+        let projects = db.projects().unwrap_or_default();
+        let last_id = db.last_project_id().ok().flatten();
+        let active_project = last_id.and_then(|id| projects.iter().find(|p| p.id == id).cloned());
+        let new_cwd = active_project
+            .as_ref()
+            .map(|p| p.path.clone())
+            .unwrap_or_else(home_string);
+
+        let status = db_error.unwrap_or_else(|| {
+            if saved.tabs.is_empty() {
+                "No open tabs.".to_string()
+            } else {
+                format!("Restored {} tab(s).", saved.tabs.len())
+            }
+        });
+
         let mut app = Self {
             agent: Agent::Claude,
             sessions: Vec::new(),
             tabs: saved.tabs,
             slots,
             active,
-            new_cwd: home_string(),
+            new_cwd,
             status,
             store,
+            db,
+            projects,
+            active_project,
+            show_projects: false,
+            new_project_name: String::new(),
+            new_project_path: String::new(),
+            project_error: None,
         };
         app.refresh();
         app
     }
 
     fn refresh(&mut self) {
-        self.sessions = sessions::list_sessions(self.agent);
+        self.sessions = sessions::list_sessions(self.agent, &self.new_cwd);
+    }
+
+    fn reload_projects(&mut self) {
+        self.projects = self.db.projects().unwrap_or_default();
+    }
+
+    /// Label for the current folder: the open project, or the home folder when none is open.
+    fn project_label(&self) -> String {
+        match &self.active_project {
+            Some(p) => format!("{} · {}", p.name, p.path),
+            None => format!("Home · {}", home_string()),
+        }
     }
 
     fn persist(&mut self) {
@@ -167,6 +220,68 @@ impl AgentApp {
         };
         self.open_tab(tab);
     }
+
+    /// Makes a project the open one. Its folder becomes the default for new sessions,
+    /// and the choice is saved so the next launch opens it.
+    fn open_project(&mut self, index: usize) {
+        let Some(project) = self.projects.get(index).cloned() else {
+            return;
+        };
+        self.status = match self.db.set_last_project(project.id) {
+            Ok(()) => format!("Opened project {}.", project.name),
+            Err(e) => format!("Could not save project choice: {e}"),
+        };
+        self.new_cwd = project.path.clone();
+        self.active_project = Some(project);
+        self.show_projects = false;
+        self.refresh();
+    }
+
+    fn add_project(&mut self) {
+        let name = self.new_project_name.trim().to_string();
+        let path = self.new_project_path.trim().to_string();
+        let problem = if name.is_empty() {
+            Some("Enter a project name.".to_string())
+        } else if path.is_empty() {
+            Some("Enter a folder path.".to_string())
+        } else if !Path::new(&path).is_dir() {
+            Some(format!("That folder does not exist: {path}"))
+        } else if self.projects.iter().any(|p| p.path == path) {
+            Some("A project already uses that folder.".to_string())
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            self.project_error = Some(problem);
+            return;
+        }
+        match self.db.add_project(&name, &path) {
+            Ok(_) => {
+                self.reload_projects();
+                self.new_project_name.clear();
+                self.new_project_path.clear();
+                self.project_error = None;
+            }
+            Err(e) => self.project_error = Some(format!("Could not save project: {e}")),
+        }
+    }
+
+    fn remove_project(&mut self, index: usize) {
+        let Some(project) = self.projects.get(index).cloned() else {
+            return;
+        };
+        match self.db.remove_project(project.id) {
+            Ok(()) => {
+                self.reload_projects();
+                if self.active_project.as_ref().is_some_and(|a| a.id == project.id) {
+                    self.active_project = None;
+                    self.new_cwd = home_string();
+                }
+                self.status = format!("Removed project {}.", project.name);
+            }
+            Err(e) => self.project_error = Some(format!("Could not remove project: {e}")),
+        }
+    }
 }
 
 impl eframe::App for AgentApp {
@@ -179,11 +294,23 @@ impl eframe::App for AgentApp {
         }
 
         let mut actions: Vec<Action> = Vec::new();
+        let project_label = self.project_label();
 
         egui::SidePanel::left("sessions")
             .default_width(340.0)
             .show(ctx, |ui| {
+                // Added first so the button stays pinned to the bottom of the panel.
+                egui::TopBottomPanel::bottom("projects_button").show_inside(ui, |ui| {
+                    ui.add_space(6.0);
+                    let button = egui::Button::new("Projects");
+                    if ui.add_sized([ui.available_width(), 36.0], button).clicked() {
+                        actions.push(Action::ShowProjects);
+                    }
+                    ui.add_space(6.0);
+                });
+
                 ui.heading("Agent sessions");
+                ui.weak(format!("Project: {project_label}"));
 
                 let mut agent = self.agent;
                 egui::ComboBox::from_label("Agent")
@@ -199,7 +326,8 @@ impl eframe::App for AgentApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Folder");
-                    ui.text_edit_singleline(&mut self.new_cwd);
+                    // Read-only: the folder follows the open project (or home), so it cannot drift elsewhere.
+                    ui.weak(self.new_cwd.as_str());
                 });
                 ui.horizontal(|ui| {
                     if ui.button(format!("New {} session", self.agent.label())).clicked() {
@@ -215,7 +343,7 @@ impl eframe::App for AgentApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (i, s) in self.sessions.iter().enumerate() {
                         ui.group(|ui| {
-                            ui.strong(format!("{} · {}", s.agent.label(), short_id(&s.id)));
+                            ui.strong(s.name.as_str());
                             let folder = if s.cwd.is_empty() {
                                 "(unknown folder)"
                             } else {
@@ -232,6 +360,78 @@ impl eframe::App for AgentApp {
                     }
                 });
             });
+
+        // The Projects window: one tab for now, with the project list and an add form.
+        if self.show_projects {
+            let AgentApp {
+                show_projects,
+                projects,
+                active_project,
+                new_project_name,
+                new_project_path,
+                project_error,
+                ..
+            } = self;
+            egui::Window::new("Projects")
+                .open(show_projects)
+                .default_width(460.0)
+                .show(ctx, |ui| {
+                    // A single tab for now. The strip is here so more tabs can sit beside it later.
+                    ui.horizontal(|ui| {
+                        let _ = ui.selectable_label(true, "Projects");
+                    });
+                    ui.separator();
+
+                    ui.strong("Add a project");
+                    egui::Grid::new("add_project").num_columns(2).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut *new_project_name);
+                        ui.end_row();
+                        ui.label("Folder");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut *new_project_path)
+                                .hint_text("e.g. C:/code/my-app"),
+                        );
+                        ui.end_row();
+                    });
+                    if ui.button("Add project").clicked() {
+                        actions.push(Action::AddProject);
+                    }
+                    if let Some(err) = project_error.as_deref() {
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    }
+                    ui.separator();
+
+                    ui.strong(format!("Saved projects ({})", projects.len()));
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            if projects.is_empty() {
+                                ui.weak("No projects yet.");
+                            }
+                            for (i, p) in projects.iter().enumerate() {
+                                let is_open = active_project.as_ref().is_some_and(|a| a.id == p.id);
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.strong(p.name.as_str());
+                                        if is_open {
+                                            ui.colored_label(egui::Color32::LIGHT_GREEN, "open");
+                                        }
+                                    });
+                                    ui.weak(p.path.as_str());
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Open").clicked() {
+                                            actions.push(Action::OpenProject(i));
+                                        }
+                                        if ui.button("Remove").clicked() {
+                                            actions.push(Action::RemoveProject(i));
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -308,6 +508,13 @@ impl eframe::App for AgentApp {
                         self.slots[i] = Slot::Idle;
                     }
                 }
+                Action::ShowProjects => {
+                    self.show_projects = true;
+                    self.project_error = None;
+                }
+                Action::AddProject => self.add_project(),
+                Action::OpenProject(i) => self.open_project(i),
+                Action::RemoveProject(i) => self.remove_project(i),
             }
         }
     }
@@ -322,12 +529,8 @@ fn session_tab(s: &SessionInfo, fallback_cwd: &str) -> Tab {
         } else {
             s.cwd.clone()
         },
-        title: format!("{} · {}", s.agent.label(), short_id(&s.id)),
+        title: s.name.clone(),
     }
-}
-
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
 }
 
 fn age(t: SystemTime) -> String {
@@ -350,11 +553,19 @@ fn home_string() -> String {
         .unwrap_or_default()
 }
 
-fn store_path() -> PathBuf {
+/// Folder for the app's data: tabs.json and the SQLite database.
+fn app_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("orca-agents")
-        .join("tabs.json")
+}
+
+fn store_path() -> PathBuf {
+    app_dir().join("tabs.json")
+}
+
+fn db_path() -> PathBuf {
+    app_dir().join("orca-agents.db")
 }
 
 fn load_saved(path: &PathBuf) -> Saved {
