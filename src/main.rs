@@ -2,10 +2,11 @@ mod db;
 mod sessions;
 mod terminal;
 
-use db::{Database, Project};
+use db::{Database, Project, Status, Task, TaskSession};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use sessions::{Agent, SessionInfo};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -37,6 +38,18 @@ enum Slot {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskView {
+    List,
+    Board,
+}
+
+/// A task with the sessions linked to it, cached so the window does not query the database every frame.
+struct TaskRow {
+    task: Task,
+    sessions: Vec<TaskSession>,
+}
+
 enum Action {
     SetAgent(Agent),
     Refresh,
@@ -49,6 +62,15 @@ enum Action {
     AddProject,
     OpenProject(usize),
     RemoveProject(usize),
+    ShowTasks,
+    SetView(TaskView),
+    AddTask,
+    SetStatus(i64, Status),
+    DeleteTask(i64),
+    /// Links the session at this index in the sidebar list to the task.
+    Attach(i64, usize),
+    Unlink(i64, Agent, String),
+    OpenTab(Tab),
 }
 
 struct AgentApp {
@@ -69,6 +91,13 @@ struct AgentApp {
     new_project_name: String,
     new_project_path: String,
     project_error: Option<String>,
+    task_rows: Vec<TaskRow>,
+    show_tasks: bool,
+    task_view: TaskView,
+    new_task_title: String,
+    task_error: Option<String>,
+    /// Which sidebar session each task's "Attach" picker points at, keyed by task id.
+    attach_pick: HashMap<i64, usize>,
 }
 
 impl AgentApp {
@@ -118,8 +147,15 @@ impl AgentApp {
             new_project_name: String::new(),
             new_project_path: String::new(),
             project_error: None,
+            task_rows: Vec::new(),
+            show_tasks: false,
+            task_view: TaskView::List,
+            new_task_title: String::new(),
+            task_error: None,
+            attach_pick: HashMap::new(),
         };
         app.refresh();
+        app.reload_tasks();
         app
     }
 
@@ -129,6 +165,22 @@ impl AgentApp {
 
     fn reload_projects(&mut self) {
         self.projects = self.db.projects().unwrap_or_default();
+    }
+
+    /// Reloads the tasks of the open project, with the sessions linked to each.
+    fn reload_tasks(&mut self) {
+        let Some(project_id) = self.active_project.as_ref().map(|p| p.id) else {
+            self.task_rows.clear();
+            return;
+        };
+        let tasks = self.db.tasks(project_id).unwrap_or_default();
+        self.task_rows = tasks
+            .into_iter()
+            .map(|task| {
+                let sessions = self.db.sessions_for_task(task.id).unwrap_or_default();
+                TaskRow { task, sessions }
+            })
+            .collect();
     }
 
     /// Label for the current folder: the open project, or the home folder when none is open.
@@ -234,6 +286,7 @@ impl AgentApp {
         self.new_cwd = project.path.clone();
         self.active_project = Some(project);
         self.show_projects = false;
+        self.reload_tasks();
         self.refresh();
     }
 
@@ -276,10 +329,49 @@ impl AgentApp {
                 if self.active_project.as_ref().is_some_and(|a| a.id == project.id) {
                     self.active_project = None;
                     self.new_cwd = home_string();
+                    self.refresh();
                 }
+                self.reload_tasks();
                 self.status = format!("Removed project {}.", project.name);
             }
             Err(e) => self.project_error = Some(format!("Could not remove project: {e}")),
+        }
+    }
+
+    fn add_task(&mut self) {
+        let title = self.new_task_title.trim().to_string();
+        let Some(project_id) = self.active_project.as_ref().map(|p| p.id) else {
+            self.task_error = Some("Open a project before adding tasks.".to_string());
+            return;
+        };
+        if title.is_empty() {
+            self.task_error = Some("Enter a task title.".to_string());
+            return;
+        }
+        match self.db.add_task(project_id, &title) {
+            Ok(_) => {
+                self.new_task_title.clear();
+                self.task_error = None;
+                self.reload_tasks();
+            }
+            Err(e) => self.task_error = Some(format!("Could not add task: {e}")),
+        }
+    }
+
+    /// Links the sidebar session at `index` to a task. The same session can be linked to other tasks too.
+    fn attach_session(&mut self, task_id: i64, index: usize) {
+        let Some(s) = self.sessions.get(index).cloned() else {
+            return;
+        };
+        match self
+            .db
+            .link_session(task_id, agent_key(s.agent), &s.id, &s.name, &s.cwd)
+        {
+            Ok(()) => {
+                self.task_error = None;
+                self.reload_tasks();
+            }
+            Err(e) => self.task_error = Some(format!("Could not attach session: {e}")),
         }
     }
 }
@@ -299,11 +391,20 @@ impl eframe::App for AgentApp {
         egui::SidePanel::left("sessions")
             .default_width(340.0)
             .show(ctx, |ui| {
-                // Added first so the button stays pinned to the bottom of the panel.
-                egui::TopBottomPanel::bottom("projects_button").show_inside(ui, |ui| {
+                // Added first so the buttons stay pinned to the bottom of the panel.
+                egui::TopBottomPanel::bottom("bottom_buttons").show_inside(ui, |ui| {
                     ui.add_space(6.0);
-                    let button = egui::Button::new("Projects");
-                    if ui.add_sized([ui.available_width(), 36.0], button).clicked() {
+                    if ui
+                        .add_sized([ui.available_width(), 36.0], egui::Button::new("Tasks"))
+                        .clicked()
+                    {
+                        actions.push(Action::ShowTasks);
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_sized([ui.available_width(), 36.0], egui::Button::new("Projects"))
+                        .clicked()
+                    {
                         actions.push(Action::ShowProjects);
                     }
                     ui.add_space(6.0);
@@ -360,6 +461,94 @@ impl eframe::App for AgentApp {
                     }
                 });
             });
+
+        // The Tasks window: List or Board, for the open project.
+        if self.show_tasks {
+            let AgentApp {
+                show_tasks,
+                task_rows,
+                task_view,
+                new_task_title,
+                task_error,
+                attach_pick,
+                sessions,
+                active_project,
+                ..
+            } = self;
+            let view = *task_view;
+            egui::Window::new("Tasks")
+                .open(show_tasks)
+                .default_width(720.0)
+                .default_height(480.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(view == TaskView::List, "List").clicked() {
+                            actions.push(Action::SetView(TaskView::List));
+                        }
+                        if ui.selectable_label(view == TaskView::Board, "Board").clicked() {
+                            actions.push(Action::SetView(TaskView::Board));
+                        }
+                        ui.separator();
+                        match active_project.as_ref() {
+                            Some(p) => ui.strong(p.name.as_str()),
+                            None => ui.weak("No project open"),
+                        };
+                    });
+                    ui.separator();
+
+                    if active_project.is_none() {
+                        ui.weak("Open a project to see and add its tasks.");
+                        return;
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut *new_task_title)
+                                .hint_text("New task title")
+                                .desired_width(360.0),
+                        );
+                        if ui.button("Add task").clicked() {
+                            actions.push(Action::AddTask);
+                        }
+                    });
+                    if let Some(err) = task_error.as_deref() {
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    }
+                    ui.separator();
+
+                    let rows: &[TaskRow] = task_rows.as_slice();
+                    let sidebar: &[SessionInfo] = sessions.as_slice();
+                    match view {
+                        TaskView::List => {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                if rows.is_empty() {
+                                    ui.weak("No tasks yet. Add one above.");
+                                }
+                                for row in rows {
+                                    let pick = attach_pick.entry(row.task.id).or_insert(0);
+                                    task_card(ui, row, sidebar, pick, &mut actions, false);
+                                }
+                            });
+                        }
+                        TaskView::Board => {
+                            ui.columns(3, |cols| {
+                                for (c, status) in Status::ALL.iter().enumerate() {
+                                    let col = &mut cols[c];
+                                    let count = rows.iter().filter(|r| r.task.status == *status).count();
+                                    col.strong(format!("{} ({count})", status.label()));
+                                    col.separator();
+                                    egui::ScrollArea::vertical().id_salt(("board_column", c)).show(col, |col| {
+                                        for row in rows.iter().filter(|r| r.task.status == *status) {
+                                            let pick = attach_pick.entry(row.task.id).or_insert(0);
+                                            task_card(col, row, sidebar, pick, &mut actions, true);
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }
+                });
+        }
 
         // The Projects window: one tab for now, with the project list and an add form.
         if self.show_projects {
@@ -515,9 +704,119 @@ impl eframe::App for AgentApp {
                 Action::AddProject => self.add_project(),
                 Action::OpenProject(i) => self.open_project(i),
                 Action::RemoveProject(i) => self.remove_project(i),
+                Action::ShowTasks => {
+                    self.show_tasks = true;
+                    self.task_error = None;
+                    self.reload_tasks();
+                }
+                Action::SetView(view) => self.task_view = view,
+                Action::AddTask => self.add_task(),
+                Action::SetStatus(id, status) => {
+                    if let Err(e) = self.db.set_status(id, status) {
+                        self.task_error = Some(format!("Could not update task: {e}"));
+                    }
+                    self.reload_tasks();
+                }
+                Action::DeleteTask(id) => {
+                    self.attach_pick.remove(&id);
+                    if let Err(e) = self.db.delete_task(id) {
+                        self.task_error = Some(format!("Could not delete task: {e}"));
+                    }
+                    self.reload_tasks();
+                }
+                Action::Attach(id, index) => self.attach_session(id, index),
+                Action::Unlink(id, agent, session_id) => {
+                    if let Err(e) = self.db.unlink_session(id, agent_key(agent), &session_id) {
+                        self.task_error = Some(format!("Could not unlink session: {e}"));
+                    }
+                    self.reload_tasks();
+                }
+                Action::OpenTab(tab) => self.open_tab(tab),
             }
         }
     }
+}
+
+/// One task: its title, status, linked sessions, and controls. On the board, status moves with < and >.
+fn task_card(
+    ui: &mut egui::Ui,
+    row: &TaskRow,
+    sidebar: &[SessionInfo],
+    pick: &mut usize,
+    actions: &mut Vec<Action>,
+    board: bool,
+) {
+    let id = row.task.id;
+    let status = row.task.status;
+    ui.group(|ui| {
+        ui.strong(row.task.title.as_str());
+        if board {
+            ui.horizontal(|ui| {
+                if ui.small_button("<").clicked() {
+                    actions.push(Action::SetStatus(id, status.shift(-1)));
+                }
+                ui.weak(status.label());
+                if ui.small_button(">").clicked() {
+                    actions.push(Action::SetStatus(id, status.shift(1)));
+                }
+            });
+        } else {
+            egui::ComboBox::from_id_salt(("status", id))
+                .selected_text(status.label())
+                .show_ui(ui, |ui| {
+                    for s in Status::ALL {
+                        if ui.selectable_label(s == status, s.label()).clicked() {
+                            actions.push(Action::SetStatus(id, s));
+                        }
+                    }
+                });
+        }
+
+        for link in &row.sessions {
+            ui.horizontal(|ui| {
+                let agent = agent_from_key(&link.agent);
+                let who = agent.map_or(link.agent.clone(), |a| a.label().to_string());
+                ui.label(format!("{who} · {}", link.title));
+                if let Some(agent) = agent {
+                    if ui.small_button("Open").clicked() {
+                        actions.push(Action::OpenTab(Tab {
+                            agent,
+                            session_id: Some(link.session_id.clone()),
+                            cwd: link.cwd.clone(),
+                            title: link.title.clone(),
+                        }));
+                    }
+                    if ui.small_button("Unlink").clicked() {
+                        actions.push(Action::Unlink(id, agent, link.session_id.clone()));
+                    }
+                }
+            });
+        }
+
+        if sidebar.is_empty() {
+            ui.weak("No sessions for this agent in the project folder to attach.");
+        } else {
+            let idx = (*pick).min(sidebar.len() - 1);
+            *pick = idx;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt(("attach", id))
+                    .width(200.0)
+                    .selected_text(sidebar[idx].name.as_str())
+                    .show_ui(ui, |ui| {
+                        for (i, s) in sidebar.iter().enumerate() {
+                            ui.selectable_value(&mut *pick, i, s.name.as_str());
+                        }
+                    });
+                if ui.small_button("Attach").clicked() {
+                    actions.push(Action::Attach(id, idx));
+                }
+            });
+        }
+
+        if ui.small_button("Delete task").clicked() {
+            actions.push(Action::DeleteTask(id));
+        }
+    });
 }
 
 fn session_tab(s: &SessionInfo, fallback_cwd: &str) -> Tab {
@@ -530,6 +829,23 @@ fn session_tab(s: &SessionInfo, fallback_cwd: &str) -> Tab {
             s.cwd.clone()
         },
         title: s.name.clone(),
+    }
+}
+
+fn agent_key(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Omp => "omp",
+        Agent::Pi => "pi",
+        Agent::Claude => "claude",
+    }
+}
+
+fn agent_from_key(key: &str) -> Option<Agent> {
+    match key {
+        "omp" => Some(Agent::Omp),
+        "pi" => Some(Agent::Pi),
+        "claude" => Some(Agent::Claude),
+        _ => None,
     }
 }
 

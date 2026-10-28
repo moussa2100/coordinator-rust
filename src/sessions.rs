@@ -245,6 +245,10 @@ fn read_header(path: &Path) -> (Option<String>, Option<String>) {
 /// On Windows the agent runs through `cmd /C` so npm-installed `.cmd` shims resolve.
 pub fn command_line(agent: Agent, session_id: Option<&str>) -> (String, Vec<String>) {
     let mut args = Vec::new();
+    // Without this, omp moves a session started in the home folder into a temp directory.
+    if agent == Agent::Omp {
+        args.push("--allow-home".to_string());
+    }
     if let Some(id) = session_id {
         args.push(agent.resume_flag().to_string());
         args.push(id.to_string());
