@@ -6,7 +6,7 @@ use std::path::PathBuf;
 pub fn app_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("orca-agents")
+        .join("fleet")
 }
 
 pub fn store_path() -> PathBuf {
@@ -14,7 +14,7 @@ pub fn store_path() -> PathBuf {
 }
 
 pub fn db_path() -> PathBuf {
-    app_dir().join("orca-agents.db")
+    app_dir().join("fleet.db")
 }
 
 /// The home folder as text, or empty when it is unknown.

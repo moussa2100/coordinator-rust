@@ -1,4 +1,4 @@
-//! Orca Agents: a desktop window that runs omp, pi, and Claude Code sessions side by side,
+//! Fleet: a desktop window that runs omp, pi, and Claude Code sessions side by side,
 //! grouped by project and task.
 
 mod app;
@@ -18,11 +18,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 680.0])
-            .with_title("Orca Agents"),
+            .with_title("Fleet"),
         ..Default::default()
     };
     eframe::run_native(
-        "Orca Agents",
+        "Fleet",
         options,
         Box::new(|_cc| Ok(Box::new(AgentApp::new()))),
     )
