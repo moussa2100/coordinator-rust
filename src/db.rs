@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn data_survives_reopen() {
-        let path = std::env::temp_dir().join(format!("orca-agents-test-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("fleet-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let db = Database::open(&path).unwrap();
