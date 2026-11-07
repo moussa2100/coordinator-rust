@@ -420,6 +420,7 @@ impl EmbeddedTerminal {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint(
         &self,
         ui: &egui::Ui,
