@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Color32};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
+use crate::path_env;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -90,6 +91,9 @@ impl EmbeddedTerminal {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         cmd.cwd(cwd);
+        if let Some(path) = path_env::agent_path() {
+            cmd.env("PATH", path);
+        }
         let child = pair
             .slave
             .spawn_command(cmd)

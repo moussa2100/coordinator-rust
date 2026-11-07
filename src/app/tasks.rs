@@ -37,23 +37,6 @@ impl AgentApp {
         self.task_rows.iter().find(|r| r.task.id == id)
     }
 
-    /// Indices into `sessions` that the sidebar shows: all of them, or only those linked to the selected task.
-    pub(crate) fn visible_session_indices(&self) -> Vec<usize> {
-        let linked = self.selected_row().map(|r| r.sessions.as_slice());
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                linked.is_none_or(|links| {
-                    links
-                        .iter()
-                        .any(|l| l.agent == s.agent.key() && l.session_id == s.id)
-                })
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
     pub(crate) fn show_tasks_window(&mut self) {
         self.show_tasks = true;
         self.task_error = None;

@@ -4,6 +4,7 @@
 mod app;
 mod db;
 mod paths;
+mod path_env;
 mod sessions;
 mod store;
 mod tab;
