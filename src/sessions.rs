@@ -36,6 +36,19 @@ impl Agent {
         }
     }
 
+    /// Stored form of the agent in the database. Matches the serde name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Agent::Omp => "omp",
+            Agent::Pi => "pi",
+            Agent::Claude => "claude",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Agent> {
+        Agent::ALL.into_iter().find(|a| a.key() == key)
+    }
+
     /// Flag that resumes one session by id.
     fn resume_flag(self) -> &'static str {
         match self {
