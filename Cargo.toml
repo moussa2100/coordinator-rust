@@ -3,6 +3,10 @@ name = "orca-agents"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "fleet"
+path = "src/main.rs"
+
 [dependencies]
 eframe = "0.31"
 serde = { version = "1", features = ["derive"] }
