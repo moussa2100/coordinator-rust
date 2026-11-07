@@ -1,7 +1,9 @@
 name: Release
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [master]
   workflow_dispatch:
     inputs:
@@ -24,12 +26,15 @@ env:
 jobs:
   version:
     name: Compute release tag
+    # Only runs after CI has succeeded on the commit being released.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
 
       - id: tag
@@ -78,6 +83,8 @@ jobs:
             archive: tar.gz
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
@@ -136,9 +143,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
           gh release create "$TAG" dist/* \
-            --target "$GITHUB_SHA" \
+            --target "$SHA" \
             --title "$TAG" \
             --generate-notes
